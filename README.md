@@ -1,286 +1,165 @@
-Digital Document Tampering Detection
+# Digital Document Tampering Detection
 
-A computer vision project for localizing digitally tampered regions in identity documents and passports using pixel-level image segmentation.
+Pixel-level localization of digitally tampered regions in identity documents and passports, using a U-Net-style convolutional encoder–decoder trained on synthetically forged documents built from the MIDV-2020 dataset.
 
-The project uses the MIDV-2020 document dataset to construct a tampered-document dataset and trains a convolutional encoder-decoder network to generate segmentation masks identifying potentially manipulated regions.
+The framing choice is what makes this project interesting. Most document forensics work asks "is this document fake?" — a binary classification. This asks **"which pixels were changed?"**, which is the question an actual document examiner needs answered. A binary verdict tells a border officer nothing actionable; a mask pointing at the date-of-birth field does.
 
-Overview
+> Neither the MIDV-2020 source data nor the trained weights are included in this repository.
 
-Digital manipulation of identity documents can involve changing specific attributes such as names, dates, or other personal information while leaving the rest of the document visually unchanged.
+---
 
-Rather than treating tampering detection as a simple binary classification problem, this project approaches it as an image segmentation task. The model predicts a pixel-level mask indicating the regions that are likely to have been modified.
+## The forgery generation problem
 
-The project consists of two primary stages:
+Supervised tampering localization needs pixel-accurate ground-truth masks, and no public dataset of real forged IDs with annotated tamper regions exists at meaningful scale. So the forgeries have to be manufactured.
 
-1. Forgery generation and annotation — document metadata is used to identify attribute regions and generate annotated tampered images.
-2. Tampering localization — a CNN-based encoder-decoder model is trained using the generated images and segmentation masks.
+**`ForgingAnnotation.ipynb`** builds them from MIDV-2020's VIA-format JSON annotations, which carry bounding boxes for each document field:
 
-Dataset
+| Field group | Region indices |
+|---|---|
+| Text attributes (name, surname, etc.) | 2, 3, 5, 6, 7, 8 |
+| Date attributes | 9, 10, 11 |
 
-The project is based on the MIDV-2020 dataset, which contains identity documents and passports from multiple countries.
+For each document, the generator picks two distinct attribute regions at random, crops both, and swaps them — producing a document where two fields have exchanged content while everything else is pixel-identical to the original. A binary mask marking both swapped regions is written alongside. Up to 30 distinct attribute pairs are generated per source document, with already-used pairs tracked to avoid duplicates.
 
-The original project description reports:
+Swapping fields *within* a document rather than pasting in external content is a deliberate choice: it keeps font, resolution, lighting, and JPEG history consistent, so the model can't cheat by detecting a mismatch in low-level image statistics. It has to learn something about content plausibility.
 
-- 1,000 document images
-- Documents from 10 countries
-- JSON metadata containing coordinates for document attributes such as names, surnames, dates, and other fields
+**Output:** 21,698 tampered images with matching masks, from which **6,001** were randomly sampled for training.
 
-The original dataset is not included in this repository.
-
-Data Preparation
-
-The "ForgingAnnotation.ipynb" notebook is used for preparing the training data.
-
-The workflow uses the coordinate information stored in the dataset's JSON metadata to identify document attributes. OpenCV and Python filesystem utilities are then used to create manipulated document images and corresponding annotation masks.
-
-The resulting dataset is organized into separate image and mask directories:
-
+```
 AnnotatedData/
-├── TrainingImages/
-│   └── img/
-└── TrainingMasks/
-    └── img/
+├── TrainingImages/img/     # 6,001 tampered documents
+└── TrainingMasks/img/      # 6,001 binary masks
+```
 
-The modeling notebook subsequently pairs each tampered image with its corresponding segmentation mask.
+Image and mask filenames are kept identical (`NNNNN_tampered.jpg` in both directories) — this matters for how the training pipeline pairs them.
 
-Model Architecture
+---
 
-The project implements a custom convolutional encoder-decoder segmentation architecture with skip connections.
+## Architecture
 
-The encoder progressively reduces the spatial resolution while increasing the number of feature channels:
+**`Modeling.ipynb`** implements a U-Net-style encoder–decoder from scratch, no pretrained backbone.
 
-256 × 256 × 3
-       │
-       ▼
-   Conv Blocks
-       │
-   Max Pooling
-       │
-       ▼
-   128 × 128
-       │
-   Max Pooling
-       │
-       ▼
-    64 × 64
-       │
-   Max Pooling
-       │
-       ▼
-    32 × 32
-       │
-   Max Pooling
-       │
-       ▼
-    16 × 16
-       │
-   Max Pooling
-       │
-       ▼
-     8 × 8
-       │
-     Center
-       │
-       ▼
-  Upsampling
-       │
-  Skip Connections
-       │
-       ▼
-256 × 256 × 1
+```
+Input 256×256×3
+  ├─ Conv(16) ×2  ──────────────────────────────┐  skip
+  │  MaxPool → 128×128                          │
+  ├─ Conv(32) ×2  ────────────────────────────┐ │  skip
+  │  MaxPool → 64×64                          │ │
+  ├─ Conv(64) ×2  ──────────────────────────┐ │ │  skip
+  │  MaxPool → 32×32                        │ │ │
+  ├─ Conv(128) ×2  ───────────────────────┐ │ │ │  skip
+  │  MaxPool → 16×16                      │ │ │ │
+  ├─ Conv(256) ×2  ─────────────────────┐ │ │ │ │  skip
+  │  MaxPool → 8×8                      │ │ │ │ │
+  └─ Center: Conv(256)                  │ │ │ │ │
+     UpSample → 16×16 ──── Concatenate ─┘ │ │ │ │
+     Conv(256) ×2                         │ │ │ │
+     UpSample → 32×32 ──── Concatenate ───┘ │ │ │
+     Conv(128) ×2                           │ │ │
+     UpSample → 64×64 ──── Concatenate ─────┘ │ │
+     Conv(64) ×2                              │ │
+     UpSample → 128×128 ─── Concatenate ──────┘ │
+     Conv(32) ×2                                │
+     UpSample → 256×256 ─── Concatenate ────────┘
+     Conv(16) ×2
+     Conv(1, 1×1, sigmoid)
+Output 256×256×1
+```
 
-The decoder progressively restores the original spatial resolution. Feature maps from the encoder are concatenated with corresponding decoder representations through skip connections, allowing the network to retain spatial information needed for localization.
+| Parameter | Value |
+|---|---|
+| Input | 256 × 256 × 3 |
+| Output | 256 × 256 × 1 |
+| Encoder channels | 16 → 32 → 64 → 128 → 256 |
+| Skip connections | 5 |
+| Trainable parameters | 4,322,689 |
+| Output activation | Sigmoid |
 
-The final layer uses a "1×1" convolution with a sigmoid activation to produce a single-channel segmentation mask.
+All convolutions are 3×3 with `same` padding; upsampling is nearest-neighbour rather than transposed convolution, which avoids checkerboard artifacts at the cost of some expressiveness.
 
-Model configuration
+The skip connections are the critical piece for this task. By the 8×8 bottleneck, a tampered text field has been compressed to a handful of spatial positions — nowhere near enough to draw a mask boundary. Concatenating the full-resolution encoder features back in on the way up restores the spatial precision the localization needs.
 
-Parameter| Value
-Input size| 256 × 256 × 3
-Output| 256 × 256 × 1
-Architecture| CNN encoder-decoder
-Skip connections| Yes
-Trainable parameters| 4,322,689
-Output activation| Sigmoid
+### Loss
 
-The architecture and parameter count are taken directly from the modeling notebook.
+Binary cross-entropy plus Dice loss:
 
-Training
+```python
+dice_coeff = (2·|y_true ∩ y_pred| + 1) / (|y_true| + |y_pred| + 1)
+dice_loss  = 1 − dice_coeff
+bce_dice_loss = binary_crossentropy + dice_loss
+```
 
-Images and masks are resized to 256 × 256 and normalized by dividing pixel values by 255.
+The combination matters because tampered regions occupy a small fraction of each document. BCE alone would be minimized well by a model that predicts "background" everywhere — that's over 95% correct on a pixel count. Dice measures overlap between predicted and true regions, so it stays sensitive to the minority class. The `smooth = 1.` term prevents division by zero on images with an empty mask.
 
-The training pipeline uses:
+---
 
-- Batch size: "2"
-- Validation split: "20%"
-- Training images: "4,801"
-- Validation images: "1,200"
-- Optimizer: RMSprop
-- Learning rate: "0.0015"
-- Training duration: up to 70 epochs
+## Training
 
-The notebook uses Keras "ImageDataGenerator" instances to load the document images and grayscale segmentation masks.
+| Setting | Value |
+|---|---|
+| Train / validation | 4,801 / 1,200 (80/20 split) |
+| Batch size | 2 |
+| Steps per epoch | 2,400 |
+| Optimizer | RMSprop, `learning_rate=0.0015` |
+| Epochs | 70 (all completed) |
+| Checkpoint | best `val_loss` |
+| Time per epoch | ~800 s (~15.5 hours total, CPU) |
 
-Loss Function
+Images and masks are loaded through **separate** `ImageDataGenerator` flows — RGB for images, grayscale for masks — and paired with `zip()`. Both use `seed=33` so the shuffling stays aligned, which works here because the two directories contain identically-named files that sort into the same order.
 
-The model combines Binary Cross-Entropy and Dice loss:
+### Results
 
-BCE + Dice Loss
+| Metric | Train | Validation |
+|---|---|---|
+| Loss | 0.4717 | **0.6768** |
+| Dice coefficient | 0.5514 | **0.3594** |
 
-Dice loss is defined as:
+Best checkpoint at **epoch 50**. No subsequent epoch improved on it across the remaining 20.
 
-Dice Loss = 1 - Dice Coefficient
+### Reading these numbers honestly
 
-This combination is suitable for segmentation because it considers both pixel-wise classification and overlap between the predicted and ground-truth regions.
+A validation Dice of 0.36 means predicted and true tamper regions overlap by about a third. The model has learned something — random output would score far lower — but this is not a working detector.
 
-Checkpointing
+Two things are visible in the training log. First, **the gap doesn't close**: training Dice climbs steadily from 0.53 to 0.56 while validation oscillates between 0.30 and 0.36 with no trend. Second, **validation loss is almost entirely Dice loss**. With `val_dice ≈ 0.36`, the Dice component alone is ≈ 0.64, leaving only ≈ 0.04 for BCE. The model easily gets the background right and struggles specifically at the thing the task is about — the boundaries of the tampered regions.
 
-The best model checkpoint is selected according to validation loss:
+The first thing I'd investigate is the mask format; see *Known issues*.
 
-ModelCheckpoint(
-    monitor="val_loss",
-    save_best_only=True,
-    mode="min"
-)
+---
 
-The trained model is saved as "best_model_2.h5" during the notebook workflow.
+## Inference
 
-Results
+```python
+img = cv2.imread('document.jpg')
+img = cv2.resize(img, (256, 256))
+img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+x   = np.expand_dims(img.astype("float32") / 255.0, axis=0)
+mask = model.predict(x)
+binary = (mask[0, :, :, 0] >= threshold) * 255
+```
 
-The training notebook records the following best validation result:
+---
 
-Metric| Best recorded value
-Validation loss| ~0.6768
-Validation Dice coefficient| ~0.3594
-Epoch| 50
+## Running it
 
-The best validation loss was recorded at epoch 50, after which subsequent epochs did not improve the checkpoint according to the monitored validation loss.
-
-These results should be interpreted as the results of the original experiment rather than as a benchmark against current state-of-the-art document tampering detection methods.
-
-Inference
-
-The modeling notebook includes a testing workflow that loads a trained Keras model and performs inference on an individual document image.
-
-The image is:
-
-1. Loaded with OpenCV.
-2. Resized to 256 × 256.
-3. Converted to floating-point representation.
-4. Normalized to "[0, 1]".
-5. Expanded with a batch dimension.
-6. Passed through the segmentation model.
-
-The model outputs a pixel-level prediction mask representing the detected tampered regions.
-
-Repository Structure
-
-Digital-Document-Tampering-Detection/
-│
-├── ForgingAnnotation.ipynb
-├── Modeling.ipynb
-└── README.md
-
-Notebooks
-
-"ForgingAnnotation.ipynb"
-
-Data preparation and annotation workflow used to generate tampered document images and corresponding masks.
-
-"Modeling.ipynb"
-
-Contains:
-
-- Dataset loading
-- Image/mask preprocessing
-- Model architecture
-- Custom loss functions
-- Model training
-- Checkpointing
-- Model testing and inference
-
-The repository currently consists primarily of these two Jupyter notebooks.
-
-Technologies
-
-- Python
-- TensorFlow
-- Keras
-- OpenCV
-- NumPy
-- Matplotlib
-- Jupyter Notebook / Google Colab
-
-Getting Started
-
-1. Clone the repository
-
+```bash
 git clone https://github.com/RovshanBayramRB/Digital-Document-Tampering-Detection.git
 cd Digital-Document-Tampering-Detection
-
-2. Install dependencies
-
-The original project was developed using TensorFlow/Keras and supporting Python libraries.
-
-For example:
-
 pip install tensorflow opencv-python numpy matplotlib jupyter
+```
 
-3. Obtain the dataset
+1. Obtain [MIDV-2020](http://l3i-share.univ-lr.fr/MIDV2020/midv2020.html) — document images plus VIA JSON annotations.
+2. Open `ForgingAnnotation.ipynb`, set the dataset paths, uncomment the generation cells, and run to produce tampered images and masks.
+3. Open `Modeling.ipynb`, point it at the generated `TrainingImages/` and `TrainingMasks/` directories, and train.
 
-Download the required MIDV-2020 dataset separately and prepare the document images and JSON metadata.
+Expect roughly 13 minutes per epoch on CPU. A GPU runtime is strongly recommended.
 
-The dataset is not distributed with this repository.
+---
 
-4. Generate annotated data
+## Repository structure
 
-Open:
-
-ForgingAnnotation.ipynb
-
-Configure the dataset paths and execute the notebook to generate the tampered images and corresponding masks.
-
-5. Train the model
-
-Open:
-
-Modeling.ipynb
-
-Configure the paths to the generated training data and execute the notebook.
-
-Limitations
-
-This repository represents an experimental research project and is primarily implemented as Jupyter notebooks.
-
-Some aspects of the original implementation are environment-specific, including Google Colab/Google Drive paths and locally stored model files. Therefore, additional configuration may be required to reproduce the original experiment.
-
-The repository does not currently include:
-
-- A standalone inference script
-- A packaged Python application
-- Automated tests
-- Dependency lock files
-- Trained model weights
-- The original dataset
-
-Future Improvements
-
-Potential directions for extending the project include:
-
-- Refactoring the notebook workflow into reusable Python modules
-- Adding a standalone inference CLI
-- Providing reproducible dependency management
-- Adding automated evaluation metrics such as IoU and F1-score
-- Experimenting with modern segmentation architectures
-- Improving the training/validation data pipeline
-- Adding visualization utilities for predicted tampering masks
-- Including representative input/output examples
-- Providing a lightweight demo application
-
-Author
-
-Rovshan Bayram
-
-AI Engineer | Data Scientist
-
-"GitHub" (https://github.com/RovshanBayramRB)
+```
+.
+├── ForgingAnnotation.ipynb   # Synthetic forgery generation and mask annotation
+├── Modeling.ipynb            # Architecture, training, inference
+└── README.md
+```
